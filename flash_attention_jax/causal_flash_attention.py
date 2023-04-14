@@ -16,7 +16,7 @@ K_CHUNK_SIZE = 1024
 # flash attention
 
 def _query_chunk_flash_attention(q_range_chunk, k_range, q, k, v):
-    q_len, k_len, dim, v_dim = q.shape[-2], *k.shape, v.shape[-1]
+    q_len, batch_size, num_heads, k_len, dim, v_dim = q.shape[-2], *k.shape, v.shape[-1]
     scale = 1 / jnp.sqrt(dim)
     q_scaled  = q * scale
 
@@ -24,14 +24,19 @@ def _query_chunk_flash_attention(q_range_chunk, k_range, q, k, v):
         key_chunk_idx, out, row_sum, row_max = carries
         k_chunk_sizes = min(K_CHUNK_SIZE, k_len)
 
-        k_chunk = lax.dynamic_slice(k, (key_chunk_idx, 0), slice_sizes=(k_chunk_sizes, dim))
-        v_chunk = lax.dynamic_slice(v, (key_chunk_idx, 0), slice_sizes=(k_chunk_sizes, v_dim))
+        k_chunk = lax.dynamic_slice(
+            k, (0, 0, key_chunk_idx, 0), slice_sizes=(batch_size, num_heads, k_chunk_sizes, dim)
+        )
+        v_chunk = lax.dynamic_slice(
+            v, (0, 0, key_chunk_idx, 0), slice_sizes=(batch_size, num_heads, k_chunk_sizes, v_dim)
+        )
 
         k_range_chunk = lax.dynamic_slice(k_range, (0, key_chunk_idx), slice_sizes=(1, k_chunk_sizes))
 
         causal_mask = q_range_chunk < k_range_chunk
 
-        attn_weights = q_scaled @ k_chunk.transpose()
+        k_chunk_transposed = jnp.swapaxes(k_chunk, -1, -2)
+        attn_weights = q_scaled @ k_chunk_transposed
 
         attn_weights = jnp.where(causal_mask, MASK_VALUE, attn_weights)
 
@@ -57,20 +62,20 @@ def _query_chunk_flash_attention(q_range_chunk, k_range, q, k, v):
 
         return (key_chunk_idx + k_chunk_sizes, out, new_row_sum, new_row_max), None
 
-    out = jnp.zeros((q_len, dim))
-    row_sum = jnp.zeros((q_len, 1))
-    row_max = jnp.ones((q_len, 1)) * -1e6
+    out = jnp.zeros((batch_size, num_heads, q_len, dim))
+    row_sum = jnp.zeros((batch_size, num_heads, q_len, 1))
+    row_max = jnp.ones((batch_size, num_heads, q_len, 1)) * -1e6
 
     (_, out, row_sum, row_max), _ = lax.scan(chunk_scanner, init = (0, out, row_sum, row_max), xs = None, length = math.ceil(k_len / K_CHUNK_SIZE))
 
-    out = out.reshape(q_len, v_dim)
-    row_sum = row_sum.reshape(q_len)
-    row_max = row_max.reshape(q_len)
+    out = out.reshape(batch_size, num_heads, q_len, v_dim)
+    row_sum = row_sum.reshape(batch_size, num_heads, q_len)
+    row_max = row_max.reshape(batch_size, num_heads, q_len)
 
     return out, row_sum, row_max
 
 def _causal_flash_attention(q, k, v):
-    q_len, dim, k_len, v_dim = *q.shape, *v.shape
+    batch_size, num_heads, q_len, dim, k_len, v_dim = *q.shape, *v.shape[-2:]
 
     q_range = jnp.arange(q_len).reshape(q_len, 1) + (k_len - q_len)
     k_range = jnp.arange(k_len).reshape(1, k_len)
@@ -78,23 +83,23 @@ def _causal_flash_attention(q, k, v):
     def chunk_scanner(chunk_idx, _):
         chunk_sizes = min(Q_CHUNK_SIZE, q_len)
 
-        q_chunk = lax.dynamic_slice(q, (chunk_idx, 0), slice_sizes = (chunk_sizes, dim))
-        q_range_chunk = lax.dynamic_slice(q_range, (chunk_idx, 0), slice_sizes = (chunk_sizes, 1))
+        q_chunk = lax.dynamic_slice(q, (0, 0, chunk_idx, 0), slice_sizes=(batch_size, num_heads, chunk_sizes, dim))
+        q_range_chunk = lax.dynamic_slice(q_range, (chunk_idx, 0), slice_sizes=(chunk_sizes, 1))
 
         return (chunk_idx + chunk_sizes, _query_chunk_flash_attention(q_range_chunk, k_range, q_chunk, k, v))
 
     _, (out, row_sum, row_max) = lax.scan(chunk_scanner, init = 0, xs = None, length = math.ceil(q_len / Q_CHUNK_SIZE))
 
-    out = out.reshape(q_len, v_dim)
-    row_sum = row_sum.reshape(q_len)
-    row_max = row_max.reshape(q_len)
+    out = jnp.moveaxis(out, 0, 2).reshape(batch_size, num_heads, q_len, v_dim)
+    row_sum = jnp.moveaxis(row_sum, 0, 2).reshape(batch_size, num_heads, q_len)
+    row_max = jnp.moveaxis(row_max, 0, 2).reshape(batch_size, num_heads, q_len)
 
     return out, (row_sum, row_max)
 
 @custom_vjp
 def causal_flash_attention(q, k, v):
-  out, _ = _causal_flash_attention(q, k, v)
-  return out
+    out, _ = _causal_flash_attention(q, k, v)
+    return out
 
 @jit
 def flash_attention_forward(q, k, v):
